@@ -415,24 +415,32 @@ async function runScan() {
     premiums.forEach(p => { fMap[p.symbol]=p.lastFundingRate; mMap[p.symbol]=p.markPrice; });
     tickers.forEach(t  => { tMap[t.symbol]=t; });
 
-    // Top 120 by volume
-    const perps = tickers
-      .filter(t => t.symbol.endsWith('USDT') && !SKIP.has(t.symbol) && +t.quoteVolume > 200000)
-      .sort((a,b) => +b.quoteVolume - +a.quoteVolume)
-      .slice(0, 120);
-    console.log(`   Scanning ${perps.length} symbols with klines...`);
+    // ── Pre-filter: all USDT perps above min volume ────────────
+    // Sort: HOT coins first (big 24h move OR extreme funding) so
+    // we catch breakouts even if they're low-cap
+    const allPerps = tickers
+      .filter(t => t.symbol.endsWith('USDT') && !SKIP.has(t.symbol) && +t.quoteVolume > 50000)
+      .sort((a, b) => {
+        // Priority score: abs(24h%) + abs(funding*1000) + log(volume)
+        const aHot = Math.abs(+a.priceChangePercent) + Math.abs((fMap[a.symbol]||0)*1000) + Math.log10(+a.quoteVolume||1);
+        const bHot = Math.abs(+b.priceChangePercent) + Math.abs((fMap[b.symbol]||0)*1000) + Math.log10(+b.quoteVolume||1);
+        return bHot - aHot;
+      });
+
+    console.log(`   Scanning ALL ${allPerps.length} symbols (hot-first order)...`);
 
     const alerts = [];
 
-    // Batches of 6 with 100ms gap — stays well under Binance rate limit
-    for (let i=0; i<perps.length; i+=6) {
-      const batch = perps.slice(i, i+6);
+    // Larger batches (12 parallel) + shorter sleep = scans 600 coins in ~60s
+    // Binance rate limit is 2400 weight/min; each klines call = 2 weight → safe up to 1200/min
+    for (let i=0; i<allPerps.length; i+=12) {
+      const batch = allPerps.slice(i, i+12);
       const results = await Promise.all(batch.map(async t => {
         try {
           const kl = await get(`/fapi/v1/klines?symbol=${t.symbol}&interval=5m&limit=75`);
           if (!Array.isArray(kl) || kl.length < 25) return null;
           const res = scoreCoin(kl, fMap[t.symbol], mMap[t.symbol], t.lastPrice, tMap[t.symbol]);
-          if (!res || res.score < 10) return null; // collect all ≥10 like PWA
+          if (!res || res.score < 10) return null;
           return {
             symbol: t.symbol, base: t.symbol.replace('USDT',''),
             price: +t.lastPrice, change24h: +t.priceChangePercent,
@@ -443,12 +451,11 @@ async function runScan() {
             ...res
           };
         } catch(e) {
-          // Silently skip individual coin errors
-          return null;
+          return null; // skip individual failures silently
         }
       }));
       alerts.push(...results.filter(Boolean));
-      if (i+6 < perps.length) await sleep(100);
+      if (i+12 < allPerps.length) await sleep(55); // ~18 batches/s → well under rate limit
     }
 
     alerts.sort((a,b) => b.score - a.score);
@@ -458,9 +465,10 @@ async function runScan() {
 
     const elapsed = ((Date.now()-t0)/1000).toFixed(1);
     console.log(`✅ Scan done in ${elapsed}s — ${alerts.length} alert(s) (score≥${ALERT_THRESHOLD})`);
-    alerts.slice(0,5).forEach(a =>
-      console.log(`   🎯 ${a.base} score=${a.score} ${a.direction} RSI=${a.rsi} $${fmtP(a.price)} vol=${fmtV(a.volume)}`)
-    );
+    alerts.slice(0,8).forEach(a => {
+      const w = a.isWhale ? ' 🐋' : '';
+      console.log(`   ${a.score>=14?'🎯':a.score>=12?'⚡':'📡'} ${a.base}${w} ${a.score}/23 ${a.direction} RSI=${a.rsi} $${fmtP(a.price)} vol=${fmtV(a.volume)}`);
+    });
 
     const pushAlerts = alerts.filter(a => a.score >= ALERT_THRESHOLD);
     if (fcmReady && pushAlerts.length > 0) await sendPush(pushAlerts);
@@ -492,10 +500,22 @@ async function sendPush(alerts) {
 
   fresh.forEach(a => { lastNotified[a.symbol] = now; });
 
-  const top  = fresh[0];
-  const dir  = top.direction==='PUMP'?'▲ PUMP':top.direction==='DUMP'?'▼ DUMP':'◈ MOVE';
-  const title = `🎯 HumanLens — ${top.base}  Score ${top.score}`;
-  const body  = `${dir} · $${fmtP(top.price)} · RSI ${top.rsi}\n${top.signals.slice(0,3).join(' · ')}`;
+  const top   = fresh[0];
+  const dir   = top.direction==='PUMP' ? '▲ PUMP' : top.direction==='DUMP' ? '▼ DUMP' : '◈ COILING';
+  const whale = top.isWhale ? ' 🐋WHALE' : '';
+  const sniper= top.score >= 14 ? '🎯 SNIPER' : top.score >= 12 ? '⚡ SETUP' : '📡 SIGNAL';
+  const sltp  = top.sl && top.tp
+    ? `SL $${fmtP(top.sl)}  TP $${fmtP(top.tp)}`
+    : '';
+  const fr    = top.fundingRate ? ` FR${top.fundingRate>0?'+':''}${top.fundingRate.toFixed(3)}%` : '';
+
+  const title = `${sniper}${whale} ${top.base} [${top.score}/23]`;
+  const body  = [
+    `${dir} · $${fmtP(top.price)} · RSI ${top.rsi}${fr}`,
+    top.signals.slice(0,4).join(' · '),
+    sltp,
+    fresh.length > 1 ? `+${fresh.length-1} more: ${fresh.slice(1,3).map(a=>`${a.base}(${a.score})`).join(' ')}` : ''
+  ].filter(Boolean).join('\n');
 
   const deadTokens = [];
   let sent = 0;
@@ -559,27 +579,7 @@ async function sendPush(alerts) {
     console.log(`   Removed ${deadTokens.length} dead token(s)`);
   }
 
-  // Send summary if multiple alerts
-  if (fresh.length > 1) {
-    const summary = fresh.slice(1,4).map(a=>`${a.base} ${a.direction} (${a.score})`).join(' · ');
-    for (const token of Object.keys(subscriptions)) {
-      try {
-        await admin.messaging().send({
-          token,
-          notification: { title:`+${fresh.length-1} more signals`, body:summary },
-          webpush: {
-            headers: { Urgency:'high', TTL:'900' },
-            notification: {
-              title:`+${fresh.length-1} more signals`, body:summary,
-              icon:'/icon.svg', badge:'/icon.svg', tag:'hl-multi', renotify:true
-            }
-          }
-        });
-      } catch(e) {}
-    }
-  }
-
-  console.log(`   📨 Push sent to ${sent} device(s) — ${fresh.length} fresh alert(s)`);
+  console.log(`   📨 Push sent to ${sent} device(s) — ${fresh.length} alert(s) [top: ${top.base} ${top.score}/23${top.isWhale?' 🐋':''}]`);
 }
 
 // ── Start ─────────────────────────────────────────────────────
