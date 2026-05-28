@@ -17,24 +17,42 @@ const path    = require('path');
 const PORT            = process.env.PORT || 3000;
 const ALERT_THRESHOLD = parseInt(process.env.ALERT_THRESHOLD || '11');
 const SCAN_INTERVAL   = parseInt(process.env.SCAN_INTERVAL   || '180000');
-const BINANCE         = 'fapi.binance.com';
+// Binance mirrors — tried in order until one works
+// fapi1/fapi2/fapi3 are official Binance load-balanced endpoints,
+// less likely to be geo-blocked than the primary fapi.binance.com
+const BINANCE_MIRRORS = [
+  'fapi1.binance.com',
+  'fapi2.binance.com',
+  'fapi3.binance.com',
+  'fapi.binance.com',
+];
+let activeMirror = BINANCE_MIRRORS[0]; // updated at runtime to whichever works
 const SKIP = new Set([
   'BUSDUSDT','USDCUSDT','TUSDUSDT','FDUSDUSDT',
   'USDPUSDT','BTCDOMUSDT','DEFIUSDT','COCOSUSDT'
 ]);
 
-// ── Simple fetch using native https (no node-fetch needed) ────
-function get(hostname, path) {
+// ── Native https GET with mirror fallback ─────────────────────
+function getFromHost(hostname, urlPath) {
   return new Promise((resolve, reject) => {
     const req = https.request(
-      { hostname, path, method: 'GET',
-        headers: { 'User-Agent': 'HumanLens/1.0' } },
+      { hostname, path: urlPath, method: 'GET',
+        headers: { 'User-Agent': 'Mozilla/5.0 HumanLens/1.1' } },
       res => {
         let data = '';
         res.on('data', c => data += c);
         res.on('end', () => {
-          try { resolve(JSON.parse(data)); }
-          catch(e) { reject(new Error('JSON parse: ' + data.slice(0,120))); }
+          try {
+            const json = JSON.parse(data);
+            // Binance geo-block returns {code:-1130} or msg contains 'restricted'
+            if (json && json.msg && json.msg.toLowerCase().includes('restricted')) {
+              reject(new Error('GEO_BLOCKED: ' + json.msg.slice(0, 80)));
+            } else {
+              resolve(json);
+            }
+          } catch(e) {
+            reject(new Error('JSON parse fail: ' + data.slice(0, 120)));
+          }
         });
       }
     );
@@ -42,6 +60,34 @@ function get(hostname, path) {
     req.on('error', reject);
     req.end();
   });
+}
+
+// Try each mirror in turn — remembers which one worked last
+async function get(urlPath) {
+  // Try active mirror first (fast path)
+  try {
+    const result = await getFromHost(activeMirror, urlPath);
+    return result;
+  } catch(e) {
+    if (!e.message.startsWith('GEO_BLOCKED') && !e.message.includes('restricted')) {
+      throw e; // real error, don't retry mirrors
+    }
+    console.warn(`   ⚠️  ${activeMirror} geo-blocked, trying other mirrors...`);
+  }
+
+  // Try remaining mirrors
+  for (const mirror of BINANCE_MIRRORS) {
+    if (mirror === activeMirror) continue;
+    try {
+      const result = await getFromHost(mirror, urlPath);
+      console.log(`   ✅ Mirror ${mirror} works — switching to it`);
+      activeMirror = mirror; // remember for next time
+      return result;
+    } catch(e) {
+      console.warn(`   ✗ ${mirror}: ${e.message.slice(0, 60)}`);
+    }
+  }
+  throw new Error('All Binance mirrors geo-blocked on this server IP. Switch to Railway.app (EU region).');
 }
 
 // ── Firebase Admin ────────────────────────────────────────────
@@ -120,100 +166,199 @@ app.get('/subs', (req, res) => res.json({
   tokens: Object.keys(subscriptions).map(t => t.slice(0,20) + '...')
 }));
 
-// ── Scoring helpers ───────────────────────────────────────────
-function calcRSI(C, p=14) {
-  if (C.length < p+2) return 50;
-  const d = [];
-  for (let i=1; i<C.length; i++) d.push(C[i]-C[i-1]);
-  let ag=0, al=0;
-  for (let i=0; i<p; i++) { ag += d[i]>0?d[i]:0; al += d[i]<0?Math.abs(d[i]):0; }
-  ag/=p; al/=p;
-  for (let i=p; i<d.length; i++) {
-    const g=d[i]>0?d[i]:0, l=d[i]<0?Math.abs(d[i]):0;
-    ag=(ag*(p-1)+g)/p; al=(al*(p-1)+l)/p;
+// ═══════════════════════════════════════════════════════════
+// SCORE ENGINE — EXACT COPY FROM PWA (23-point system)
+// S1 Vol Compression, S2 Vol Spike, S3 RSI, S4 Funding Rate,
+// S5 BB Squeeze, S6 Price Coiling, S7 Mark/Last Spread,
+// S8 Candle Pattern, S9 Period Extreme, S10 Whale/Manipulation
+// ═══════════════════════════════════════════════════════════
+const fmtPct=(p,d=2)=>(p>=0?'+':'')+p.toFixed(d)+'%';
+
+
+const estLev=v=>v>=5e8?'125x':v>=1e8?'75x':v>=5e7?'50x':v>=1e7?'25x':v>=2e6?'20x':'10x';
+// ═══════════════════════════════════════
+// MATH HELPERS
+// ═══════════════════════════════════════
+function calcRSI(C,p=14){
+  if(C.length<p+2)return 50;
+  const d=[];for(let i=1;i<C.length;i++)d.push(C[i]-C[i-1]);
+  let ag=0,al=0;
+  for(let i=0;i<p;i++){if(d[i]>0)ag+=d[i];else al+=Math.abs(d[i]);}
+  ag/=p;al/=p;
+  for(let i=p;i<d.length;i++){
+    const g=d[i]>0?d[i]:0,l=d[i]<0?Math.abs(d[i]):0;
+    ag=(ag*(p-1)+g)/p;al=(al*(p-1)+l)/p;
   }
-  return al===0 ? 100 : 100 - 100/(1+ag/al);
+  return al===0?100:100-100/(1+ag/al);
 }
 
-function calcBBW(C, p=20) {
-  if (C.length<p) return null;
-  const sl=C.slice(-p), m=sl.reduce((a,b)=>a+b,0)/p;
+function calcBBW(C,p=20){
+  if(C.length<p)return null;
+  const sl=C.slice(-p),m=sl.reduce((a,b)=>a+b,0)/p;
   const s=Math.sqrt(sl.reduce((a,b)=>a+(b-m)**2,0)/p);
   return m>0?(4*s)/m:null;
 }
 
-function scoreCoin(klines, fundingRate, ticker) {
-  if (!klines || klines.length < 25) return null;
-  const C=klines.map(k=>+k[4]), V=klines.map(k=>+k[5]);
-  const H=klines.map(k=>+k[2]), L=klines.map(k=>+k[3]);
-  const O=klines.map(k=>+k[1]);
-  const last=C.length-1;
-  const avg20=V.slice(-21,-1).reduce((a,b)=>a+b,0)/20||1;
-  let sc=0, bias=0;
-  const sigs=[];
+function calcATR(H,L,C,p=14){
+  if(C.length<p+2)return C[C.length-1]*0.02; // fallback 2%
+  const tr=[];
+  for(let i=1;i<C.length;i++){
+    tr.push(Math.max(H[i]-L[i],Math.abs(H[i]-C[i-1]),Math.abs(L[i]-C[i-1])));
+  }
+  return tr.slice(-p).reduce((a,b)=>a+b,0)/p;
+}
 
-  // Volume compression
+function calcSLTP(entry,atr,dir){
+  const isPump=dir==='PUMP';
+  const sl  =isPump?entry-atr*1.5 :entry+atr*1.5;
+  const tp1 =isPump?entry+atr*2   :entry-atr*2;
+  const tp2 =isPump?entry+atr*4   :entry-atr*4;
+  const tp3 =isPump?entry+atr*7   :entry-atr*7;
+  const sign=isPump?1:-1;
+  return{
+    sl,slPct:sign*(sl-entry)/entry*100,
+    tp1,tp1Pct:sign*(tp1-entry)/entry*100,
+    tp2,tp2Pct:sign*(tp2-entry)/entry*100,
+    tp3,tp3Pct:sign*(tp3-entry)/entry*100,
+    atr
+  };
+}
+
+// ═══════════════════════════════════════
+// SCORE ENGINE (MAX 23 pts)
+// ═══════════════════════════════════════
+function scoreCoin(klines,fundingRate,markPrice,lastPrice,ticker24h){
+  if(!klines||klines.length<25)return null;
+  const C=klines.map(k=>+k[4]),V=klines.map(k=>+k[5]),
+        H=klines.map(k=>+k[2]),L=klines.map(k=>+k[3]),O=klines.map(k=>+k[1]);
+  const sigs=[];let sc=0,bias=0;const last=C.length-1;
+  const avg20=V.slice(-21,-1).reduce((a,b)=>a+b,0)/20||1;
+
+  // S1: Volume Compression (0-2)
   const rec3=V.slice(-4,-1).reduce((a,b)=>a+b,0)/3;
   const cr=rec3/avg20;
-  if (cr<0.22){sc+=2;sigs.push('Vol compressed');}
-  else if (cr<0.48){sc+=1;sigs.push('Vol tightening');}
+  if(cr<0.22){sc+=2;sigs.push({l:'Vol compressed',d:`${(cr*100).toFixed(0)}% of avg`,w:2,c:'neutral'});}
+  else if(cr<0.48){sc+=1;sigs.push({l:'Vol tightening',d:`${(cr*100).toFixed(0)}% of avg`,w:1,c:'neutral'});}
 
-  // Volume spike
-  const sR=V[last]/avg20, bull=C[last]>O[last];
-  if (sR>=5){sc+=3;sigs.push(`VOL EXPLOSION ${sR.toFixed(1)}x`);bias+=bull?3:-3;}
-  else if (sR>=3){sc+=2;sigs.push(`VOL SPIKE ${sR.toFixed(1)}x`);bias+=bull?2:-2;}
-  else if (sR>=1.9){sc+=1;sigs.push(`Vol ${sR.toFixed(1)}x`);bias+=bull?1:-1;}
+  // S2: Volume Spike (0-3)
+  const sR=V[last]/avg20;
+  const bull=C[last]>O[last];
+  if(sR>=5){sc+=3;sigs.push({l:'VOL EXPLOSION',d:`${sR.toFixed(1)}x avg`,w:3,c:'alert'});bias+=bull?3:-3;}
+  else if(sR>=3){sc+=2;sigs.push({l:'VOL SPIKE',d:`${sR.toFixed(1)}x avg`,w:2,c:'alert'});bias+=bull?2:-2;}
+  else if(sR>=1.9){sc+=1;sigs.push({l:'Vol building',d:`${sR.toFixed(1)}x avg`,w:1,c:'caution'});bias+=bull?1:-1;}
 
-  // RSI
+  // S3: RSI Extreme (0-3)
   const rsi=calcRSI(C,14);
-  if (rsi<=22){sc+=3;sigs.push(`RSI EXTREME ${rsi.toFixed(0)}`);bias+=3;}
-  else if (rsi>=78){sc+=3;sigs.push(`RSI EXTREME ${rsi.toFixed(0)}`);bias-=3;}
-  else if (rsi<=30){sc+=2;sigs.push(`RSI OS ${rsi.toFixed(0)}`);bias+=2;}
-  else if (rsi>=70){sc+=2;sigs.push(`RSI OB ${rsi.toFixed(0)}`);bias-=2;}
-  else if (rsi<=38){sc+=1;sigs.push(`RSI low ${rsi.toFixed(0)}`);bias+=1;}
-  else if (rsi>=62){sc+=1;sigs.push(`RSI hi ${rsi.toFixed(0)}`);bias-=1;}
+  if(rsi<=22){sc+=3;sigs.push({l:'RSI EXTREME oversold',d:`RSI ${rsi.toFixed(1)} — STRONG BOUNCE`,w:3,c:'bull'});bias+=3;}
+  else if(rsi>=78){sc+=3;sigs.push({l:'RSI EXTREME overbought',d:`RSI ${rsi.toFixed(1)} — STRONG DUMP`,w:3,c:'bear'});bias-=3;}
+  else if(rsi<=30){sc+=2;sigs.push({l:'RSI oversold',d:`RSI ${rsi.toFixed(1)}`,w:2,c:'bull'});bias+=2;}
+  else if(rsi>=70){sc+=2;sigs.push({l:'RSI overbought',d:`RSI ${rsi.toFixed(1)}`,w:2,c:'bear'});bias-=2;}
+  else if(rsi<=38){sc+=1;sigs.push({l:'RSI low',d:`RSI ${rsi.toFixed(1)}`,w:1,c:'bull'});bias+=1;}
+  else if(rsi>=62){sc+=1;sigs.push({l:'RSI elevated',d:`RSI ${rsi.toFixed(1)}`,w:1,c:'bear'});bias-=1;}
 
-  // Funding rate
+  // S4: Funding Rate (0-2)
   const fr=parseFloat(fundingRate||0)*100;
-  if (Math.abs(fr)>=0.08){sc+=2;sigs.push(`FR ${fr.toFixed(4)}%`);bias+=fr<0?2:-2;}
-  else if (Math.abs(fr)>=0.03){sc+=1;sigs.push(`FR ${fr.toFixed(4)}%`);bias+=fr<0?1:-1;}
+  if(Math.abs(fr)>=0.08){sc+=2;sigs.push({l:fr<0?'Funding SQUEEZE fuel':'Funding FLUSH fuel',d:`FR ${fr>0?'+':''}${fr.toFixed(4)}%`,w:2,c:fr<0?'bull':'bear'});bias+=fr<0?2:-2;}
+  else if(Math.abs(fr)>=0.03){sc+=1;sigs.push({l:'Funding elevated',d:`FR ${fr>0?'+':''}${fr.toFixed(4)}%`,w:1,c:fr<0?'bull':'bear'});bias+=fr<0?1:-1;}
 
-  // BB squeeze
+  // S5: BB Squeeze (0-2)
   const curW=calcBBW(C,20);
-  if (curW!==null) {
+  if(curW!==null){
     const hw=[];
-    for (let i=20;i<C.length-1;i++){const w=calcBBW(C.slice(0,i+1),20);if(w!==null)hw.push(w);}
-    if (hw.length>=5){
-      const aW=hw.reduce((a,b)=>a+b,0)/hw.length, sq=curW/aW;
-      if (sq<0.38){sc+=2;sigs.push('BB squeeze');}
-      else if (sq<0.62){sc+=1;sigs.push('BB tightening');}
+    for(let i=20;i<C.length-1;i++){const w=calcBBW(C.slice(0,i+1),20);if(w!==null)hw.push(w);}
+    if(hw.length>=5){
+      const aW=hw.reduce((a,b)=>a+b,0)/hw.length,sq=curW/aW;
+      if(sq<0.38){sc+=2;sigs.push({l:'BB squeeze extreme',d:`${(sq*100).toFixed(0)}% of avg width`,w:2,c:'neutral'});}
+      else if(sq<0.62){sc+=1;sigs.push({l:'BB squeezing',d:`${(sq*100).toFixed(0)}% of avg width`,w:1,c:'neutral'});}
     }
   }
 
-  // Price coiling
-  const l5H=Math.max(...H.slice(-5)), l5L=Math.min(...L.slice(-5));
+  // S6: Price Coiling (0-2)
+  const l5H=Math.max(...H.slice(-5)),l5L=Math.min(...L.slice(-5));
   const l5R=(l5H-l5L)/C[last]*100;
-  const p5H=Math.max(...H.slice(-10,-5)), p5L=Math.min(...L.slice(-10,-5));
+  const p5H=Math.max(...H.slice(-10,-5)),p5L=Math.min(...L.slice(-10,-5));
   const p5R=(p5H-p5L)/(C[last-5]||C[last])*100;
-  if (p5R>0&&l5R<p5R*0.28){sc+=2;sigs.push('Coiling tight');}
-  else if (p5R>0&&l5R<p5R*0.52){sc+=1;sigs.push('Range narrowing');}
+  if(p5R>0&&l5R<p5R*0.28){sc+=2;sigs.push({l:'Price coiling tight',d:`${l5R.toFixed(2)}% range`,w:2,c:'neutral'});}
+  else if(p5R>0&&l5R<p5R*0.52){sc+=1;sigs.push({l:'Range narrowing',d:`${l5R.toFixed(2)}% range`,w:1,c:'neutral'});}
 
-  // Near highs/lows
-  if (ticker) {
-    const pH=Math.max(...H.slice(-60)), pL=Math.min(...L.slice(-60));
-    const toH=(pH-C[last])/C[last]*100, toL=(C[last]-pL)/C[last]*100;
-    if (toL<=1.2){sc+=2;sigs.push('At period LOW');bias+=2;}
-    else if (toH<=1.2){sc+=2;sigs.push('At period HIGH');bias-=2;}
-    else if (toL<=4.0){sc+=1;sigs.push('Near low');bias+=1;}
-    else if (toH<=4.0){sc+=1;sigs.push('Near high');bias-=1;}
-
-    const ch24=+ticker.priceChangePercent;
-    if (Math.abs(ch24)>=20){sc+=2;sigs.push(`24h ${ch24>0?'+':''}${ch24.toFixed(0)}%`);bias+=ch24>0?1:-1;}
-    else if (Math.abs(ch24)>=10){sc+=1;sigs.push(`24h ${ch24>0?'+':''}${ch24.toFixed(0)}%`);}
+  // S7: Mark/Last Spread (0-2)
+  if(markPrice&&lastPrice&&+lastPrice>0){
+    const sp=(+markPrice-+lastPrice)/+lastPrice*100;
+    if(Math.abs(sp)>=0.4){sc+=2;sigs.push({l:'Mark/Last diverge',d:`${sp>0?'+':''}${sp.toFixed(3)}%`,w:2,c:sp>0?'bull':'bear'});bias+=sp>0?2:-2;}
+    else if(Math.abs(sp)>=0.15){sc+=1;sigs.push({l:'Mark/Last spread',d:`${sp>0?'+':''}${sp.toFixed(3)}%`,w:1,c:sp>0?'bull':'bear'});bias+=sp>0?1:-1;}
   }
 
-  const dir = sc>=6 ? (bias>1?'PUMP':bias<-1?'DUMP':'COILING') : 'WATCH';
-  return { score:sc, signals:sigs, direction:dir, rsi:rsi.toFixed(1), fr };
+  // S8: Candle Pattern (0-2)
+  const bodies=C.map((c,i)=>Math.abs(c-O[i])/c*100);
+  const tiny3=bodies.slice(-4,-1).every(b=>b<0.6);
+  const lc=C[last]-O[last],lb=Math.abs(lc)/C[last]*100;
+  if(tiny3&&lb>0.8){sc+=2;sigs.push({l:'Coil → Engulfing',d:lc>0?'Bullish breakout':'Bearish breakdown',w:2,c:lc>0?'bull':'bear'});bias+=lc>0?2:-2;}
+  else if(tiny3){sc+=1;sigs.push({l:'3 Doji coil',d:'Breakout pending',w:1,c:'neutral'});}
+  else{
+    const wick=H[last]-Math.max(C[last],O[last]),tail=Math.min(C[last],O[last])-L[last],body=Math.abs(C[last]-O[last]);
+    if(body>0&&tail>=body*2.2&&wick<body*0.8){sc+=1;sigs.push({l:'Hammer',d:'Bullish reversal candle',w:1,c:'bull'});bias+=1;}
+    else if(body>0&&wick>=body*2.2&&tail<body*0.8){sc+=1;sigs.push({l:'Shooting star',d:'Bearish reversal candle',w:1,c:'bear'});bias-=1;}
+  }
+
+  // S9: Period Extreme (0-2)
+  const pH=Math.max(...H.slice(-60)),pL=Math.min(...L.slice(-60));
+  const toH=(pH-C[last])/C[last]*100,toL=(C[last]-pL)/C[last]*100;
+  if(toL<=1.2){sc+=2;sigs.push({l:'At 60-period LOW',d:`${toL.toFixed(2)}% above low`,w:2,c:'bull'});bias+=2;}
+  else if(toH<=1.2){sc+=2;sigs.push({l:'At 60-period HIGH',d:`${toH.toFixed(2)}% below high`,w:2,c:'bear'});bias-=2;}
+  else if(toL<=4.0){sc+=1;sigs.push({l:'Near period low',d:`${toL.toFixed(2)}% above low`,w:1,c:'bull'});bias+=1;}
+  else if(toH<=4.0){sc+=1;sigs.push({l:'Near period high',d:`${toH.toFixed(2)}% below high`,w:1,c:'bear'});bias-=1;}
+
+  // S10: WHALE / MANIPULATION PATTERN (0-3) — The EDEN Pattern
+  // Detect: Recent huge spike (EDEN-type pump), then volume collapse = distribution
+  // Find the single highest volume candle in history
+  let whaleScore=0,whaleSigs=[];
+  const maxVol=Math.max(...V);
+  const maxVolIdx=V.indexOf(maxVol);
+  const spikeRatio=maxVol/avg20;
+  const priceAtSpike=C[maxVolIdx];
+  const priceDrop=(priceAtSpike-C[last])/priceAtSpike*100;
+
+  // Pattern A: Huge spike >8x happened, price has since dropped >15% from that candle
+  if(spikeRatio>=8&&priceDrop>=15&&maxVolIdx<last-5){
+    whaleScore+=2;
+    whaleSigs.push({l:'WHALE dump pattern',d:`Spike ${spikeRatio.toFixed(0)}x avg, then -${priceDrop.toFixed(0)}% drop — post-distribution`,w:2,c:'whale'});
+    bias-=1; // tends toward further dump after distribution
+  } else if(spikeRatio>=5&&priceDrop>=20&&maxVolIdx<last-5){
+    whaleScore+=1;
+    whaleSigs.push({l:'Large dump pattern',d:`Spike ${spikeRatio.toFixed(0)}x, -${priceDrop.toFixed(0)}% since — bounce or continue`,w:1,c:'whale'});
+  }
+
+  // Pattern B: 24h change extreme + current compression = EDEN moment
+  const ch24=ticker24h?+ticker24h.priceChangePercent:0;
+  const highLow24Pct=ticker24h?((+ticker24h.highPrice-+ticker24h.lowPrice)/+ticker24h.lowPrice*100):0;
+  if(Math.abs(ch24)>=25&&cr<0.40){
+    whaleScore+=1;
+    whaleSigs.push({l:`${ch24>0?'Pump':'Dump'} + compression`,d:`24h: ${fmtPct(ch24)}, vol now quiet — next move near`,w:1,c:'whale'});
+    bias+=ch24<0?1:-1; // counter-move more likely
+  }
+
+  // Pattern C: 24h high-low range > 35% = volatile, low-float coin being played
+  if(highLow24Pct>=35){
+    whaleScore+=1;
+    whaleSigs.push({l:'Low float play',d:`24h H-L range: ${highLow24Pct.toFixed(0)}% — whale territory`,w:1,c:'whale'});
+  }
+
+  if(whaleScore>0){
+    sc+=Math.min(whaleScore,3);
+    sigs.push(...whaleSigs);
+  }
+
+  // Direction
+  let dir='WATCH';
+  if(sc>=6){dir=bias>1?'PUMP':bias<-1?'DUMP':'COILING';}
+
+  const isWhale=whaleScore>0;
+  const atr=calcATR(H,L,C,14);
+
+  return{score:sc,maxScore:23,signals:sigs,direction:dir,bias,rsi:rsi.toFixed(1),fr,isWhale,atr,
+    ch24:ticker24h?+ticker24h.priceChangePercent:0,
+    high24:ticker24h?+ticker24h.highPrice:+lastPrice,
+    low24:ticker24h?+ticker24h.lowPrice:+lastPrice};
 }
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -235,16 +380,16 @@ async function runScan() {
   try {
     console.log('   Fetching tickers + funding rates...');
     const [tickers, premiums] = await Promise.all([
-      get(BINANCE, '/fapi/v1/ticker/24hr'),
-      get(BINANCE, '/fapi/v1/premiumIndex'),
+      get('/fapi/v1/ticker/24hr'),
+      get('/fapi/v1/premiumIndex'),
     ]);
 
     if (!Array.isArray(tickers)) throw new Error('tickers not array: ' + JSON.stringify(tickers).slice(0,100));
     if (!Array.isArray(premiums)) throw new Error('premiums not array: ' + JSON.stringify(premiums).slice(0,100));
     console.log(`   Got ${tickers.length} tickers, ${premiums.length} funding rates`);
 
-    const fMap={}, tMap={};
-    premiums.forEach(p => { fMap[p.symbol]=p.lastFundingRate; });
+    const fMap={}, mMap={}, tMap={};
+    premiums.forEach(p => { fMap[p.symbol]=p.lastFundingRate; mMap[p.symbol]=p.markPrice; });
     tickers.forEach(t  => { tMap[t.symbol]=t; });
 
     // Top 120 by volume
@@ -261,14 +406,17 @@ async function runScan() {
       const batch = perps.slice(i, i+6);
       const results = await Promise.all(batch.map(async t => {
         try {
-          const kl = await get(BINANCE, `/fapi/v1/klines?symbol=${t.symbol}&interval=5m&limit=75`);
+          const kl = await get(`/fapi/v1/klines?symbol=${t.symbol}&interval=5m&limit=75`);
           if (!Array.isArray(kl) || kl.length < 25) return null;
-          const res = scoreCoin(kl, fMap[t.symbol], tMap[t.symbol]);
-          if (!res || res.score < ALERT_THRESHOLD) return null;
+          const res = scoreCoin(kl, fMap[t.symbol], mMap[t.symbol], t.lastPrice, tMap[t.symbol]);
+          if (!res || res.score < 10) return null; // collect all ≥10 like PWA
           return {
             symbol: t.symbol, base: t.symbol.replace('USDT',''),
             price: +t.lastPrice, change24h: +t.priceChangePercent,
             volume: +t.quoteVolume, fundingRate: +(fMap[t.symbol]||0)*100,
+            markPrice: +(mMap[t.symbol]||t.lastPrice),
+            high24: +t.highPrice, low24: +t.lowPrice,
+            maxLev: estLev(+t.quoteVolume),
             ...res
           };
         } catch(e) {
@@ -291,7 +439,9 @@ async function runScan() {
       console.log(`   🎯 ${a.base} score=${a.score} ${a.direction} RSI=${a.rsi} $${fmtP(a.price)} vol=${fmtV(a.volume)}`)
     );
 
-    if (fcmReady && alerts.length > 0) await sendPush(alerts);
+    const pushAlerts = alerts.filter(a => a.score >= ALERT_THRESHOLD);
+    if (fcmReady && pushAlerts.length > 0) await sendPush(pushAlerts);
+    else if (alerts.length > 0) console.log(`   ${alerts.length} coins scored ≥10, none hit push threshold ${ALERT_THRESHOLD}`);
     else if (!fcmReady) console.log('   FCM not ready — skipping push');
     else console.log('   No alerts above threshold — no push sent');
 
