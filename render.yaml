@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: humanlens-scanner
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: ALERT_THRESHOLD
+        value: "11"
+      - key: SCAN_INTERVAL
+        value: "180000"
+      - key: FIREBASE_SERVICE_ACCOUNT
+        sync: false   # You paste this secret in Render dashboard manually
