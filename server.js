@@ -17,77 +17,100 @@ const path    = require('path');
 const PORT            = process.env.PORT || 3000;
 const ALERT_THRESHOLD = parseInt(process.env.ALERT_THRESHOLD || '11');
 const SCAN_INTERVAL   = parseInt(process.env.SCAN_INTERVAL   || '180000');
-// Binance mirrors — tried in order until one works
-// fapi1/fapi2/fapi3 are official Binance load-balanced endpoints,
-// less likely to be geo-blocked than the primary fapi.binance.com
-const BINANCE_MIRRORS = [
-  'fapi1.binance.com',
-  'fapi2.binance.com',
-  'fapi3.binance.com',
-  'fapi.binance.com',
-];
-let activeMirror = BINANCE_MIRRORS[0]; // updated at runtime to whichever works
+
+// Binance endpoint — env var lets you override without redeploying
+// On Railway (EU) fapi.binance.com works fine
+// If still blocked, set BINANCE_HOST env var to: fapi1.binance.com
+const BINANCE_HOST = process.env.BINANCE_HOST || 'fapi.binance.com';
+
 const SKIP = new Set([
   'BUSDUSDT','USDCUSDT','TUSDUSDT','FDUSDUSDT',
   'USDPUSDT','BTCDOMUSDT','DEFIUSDT','COCOSUSDT'
 ]);
 
-// ── Native https GET with mirror fallback ─────────────────────
-function getFromHost(hostname, urlPath) {
+// ── Robust native https GET ───────────────────────────────────
+// Handles: 302 redirects, gzip, chunked, timeout, retries
+function get(urlPath, retries=2) {
   return new Promise((resolve, reject) => {
-    const req = https.request(
-      { hostname, path: urlPath, method: 'GET',
-        headers: { 'User-Agent': 'Mozilla/5.0 HumanLens/1.1' } },
-      res => {
+    const options = {
+      hostname: BINANCE_HOST,
+      path: urlPath,
+      method: 'GET',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'application/json',
+        'Accept-Encoding': 'identity', // avoid gzip complications
+        'Connection': 'keep-alive'
+      }
+    };
+
+    const attempt = (attemptsLeft) => {
+      const req = https.request(options, res => {
+        // Handle redirect (302/301/307)
+        if ((res.statusCode === 301 || res.statusCode === 302 || res.statusCode === 307)
+            && res.headers.location) {
+          const loc = res.headers.location;
+          // If redirect is to a non-Binance domain it's a block page — fail fast
+          if (!loc.includes('binance.com')) {
+            return reject(new Error(
+              `GEO_BLOCKED: Redirected to ${loc.slice(0,60)} — server IP is geo-blocked by Binance`
+            ));
+          }
+          // Internal Binance redirect — follow it
+          const newPath = loc.startsWith('http') ? new URL(loc).pathname + new URL(loc).search : loc;
+          options.path = newPath;
+          if (attemptsLeft > 0) return attempt(attemptsLeft - 1);
+          return reject(new Error('Too many redirects'));
+        }
+
+        if (res.statusCode !== 200) {
+          res.resume(); // drain
+          return reject(new Error(`HTTP ${res.statusCode} for ${urlPath}`));
+        }
+
         let data = '';
-        res.on('data', c => data += c);
+        res.setEncoding('utf8');
+        res.on('data', chunk => data += chunk);
         res.on('end', () => {
+          // Check for HTML block page (starts with < or <!DOCTYPE)
+          const trimmed = data.trimStart();
+          if (trimmed.startsWith('<')) {
+            return reject(new Error(
+              `GEO_BLOCKED: Got HTML instead of JSON — server IP blocked by Binance.\n` +
+              `Fix: Set BINANCE_HOST env var to fapi1.binance.com or deploy on Railway (EU).`
+            ));
+          }
           try {
             const json = JSON.parse(data);
-            // Binance geo-block returns {code:-1130} or msg contains 'restricted'
-            if (json && json.msg && json.msg.toLowerCase().includes('restricted')) {
-              reject(new Error('GEO_BLOCKED: ' + json.msg.slice(0, 80)));
-            } else {
-              resolve(json);
+            // Binance API-level restriction message
+            if (json && json.msg && (
+              json.msg.toLowerCase().includes('restricted') ||
+              json.msg.toLowerCase().includes('unavailable')
+            )) {
+              return reject(new Error(`GEO_BLOCKED: ${json.msg.slice(0,100)}`));
             }
+            resolve(json);
           } catch(e) {
-            reject(new Error('JSON parse fail: ' + data.slice(0, 120)));
+            reject(new Error(`JSON parse: ${data.slice(0,120)}`));
           }
         });
-      }
-    );
-    req.setTimeout(15000, () => { req.destroy(); reject(new Error('Timeout')); });
-    req.on('error', reject);
-    req.end();
+        res.on('error', reject);
+      });
+
+      req.setTimeout(20000, () => { req.destroy(); reject(new Error(`Timeout: ${urlPath}`)); });
+      req.on('error', err => {
+        if (attemptsLeft > 0) {
+          console.warn(`   Retrying ${urlPath} (${attemptsLeft} left)...`);
+          setTimeout(() => attempt(attemptsLeft - 1), 1000);
+        } else {
+          reject(err);
+        }
+      });
+      req.end();
+    };
+
+    attempt(retries);
   });
-}
-
-// Try each mirror in turn — remembers which one worked last
-async function get(urlPath) {
-  // Try active mirror first (fast path)
-  try {
-    const result = await getFromHost(activeMirror, urlPath);
-    return result;
-  } catch(e) {
-    if (!e.message.startsWith('GEO_BLOCKED') && !e.message.includes('restricted')) {
-      throw e; // real error, don't retry mirrors
-    }
-    console.warn(`   ⚠️  ${activeMirror} geo-blocked, trying other mirrors...`);
-  }
-
-  // Try remaining mirrors
-  for (const mirror of BINANCE_MIRRORS) {
-    if (mirror === activeMirror) continue;
-    try {
-      const result = await getFromHost(mirror, urlPath);
-      console.log(`   ✅ Mirror ${mirror} works — switching to it`);
-      activeMirror = mirror; // remember for next time
-      return result;
-    } catch(e) {
-      console.warn(`   ✗ ${mirror}: ${e.message.slice(0, 60)}`);
-    }
-  }
-  throw new Error('All Binance mirrors geo-blocked on this server IP. Switch to Railway.app (EU region).');
 }
 
 // ── Firebase Admin ────────────────────────────────────────────
